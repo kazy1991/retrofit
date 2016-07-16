@@ -19,17 +19,16 @@ import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
-import java.util.concurrent.atomic.AtomicBoolean;
 import retrofit2.Call;
 import retrofit2.CallAdapter;
 import retrofit2.Response;
 import retrofit2.Retrofit;
+import rx.AsyncEmitter;
 import rx.Observable;
-import rx.Producer;
 import rx.Scheduler;
-import rx.Subscriber;
 import rx.Subscription;
 import rx.exceptions.Exceptions;
+import rx.functions.Action1;
 import rx.functions.Func1;
 
 /**
@@ -56,6 +55,8 @@ import rx.functions.Func1;
  * </ul>
  */
 public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
+  private static final AsyncEmitter.BackpressureMode BACKPRESSURE_MODE = AsyncEmitter.BackpressureMode.LATEST;
+
   /**
    * Returns an instance which creates synchronous observables that do not operate on any scheduler
    * by default.
@@ -135,54 +136,32 @@ public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
     return new SimpleCallAdapter(observableType, scheduler);
   }
 
-  static final class CallOnSubscribe<T> implements Observable.OnSubscribe<Response<T>> {
+  static final class CallAsyncEmitter<T> implements Action1<AsyncEmitter<Response<T>>> {
     private final Call<T> originalCall;
 
-    CallOnSubscribe(Call<T> originalCall) {
+    public CallAsyncEmitter(Call<T> originalCall) {
       this.originalCall = originalCall;
     }
 
-    @Override public void call(final Subscriber<? super Response<T>> subscriber) {
+    @Override public void call(AsyncEmitter<Response<T>> asyncEmitter) {
       // Since Call is a one-shot type, clone it for each new subscriber.
       Call<T> call = originalCall.clone();
-
-      // Wrap the call in a helper which handles both unsubscription and backpressure.
-      RequestArbiter<T> requestArbiter = new RequestArbiter<>(call, subscriber);
-      subscriber.add(requestArbiter);
-      subscriber.setProducer(requestArbiter);
+      try {
+        asyncEmitter.onNext(call.execute());
+      } catch (Throwable t) {
+        Exceptions.throwIfFatal(t);
+        asyncEmitter.onError(t);
+      }
+      // Handles unsubscription.
+      asyncEmitter.setSubscription(new RequestArbiter<>(call));
     }
   }
 
-  static final class RequestArbiter<T> extends AtomicBoolean implements Subscription, Producer {
+  static final class RequestArbiter<T> implements Subscription {
     private final Call<T> call;
-    private final Subscriber<? super Response<T>> subscriber;
 
-    RequestArbiter(Call<T> call, Subscriber<? super Response<T>> subscriber) {
+    RequestArbiter(Call<T> call) {
       this.call = call;
-      this.subscriber = subscriber;
-    }
-
-    @Override public void request(long n) {
-      if (n < 0) throw new IllegalArgumentException("n < 0: " + n);
-      if (n == 0) return; // Nothing to do when requesting 0.
-      if (!compareAndSet(false, true)) return; // Request was already triggered.
-
-      try {
-        Response<T> response = call.execute();
-        if (!subscriber.isUnsubscribed()) {
-          subscriber.onNext(response);
-        }
-      } catch (Throwable t) {
-        Exceptions.throwIfFatal(t);
-        if (!subscriber.isUnsubscribed()) {
-          subscriber.onError(t);
-        }
-        return;
-      }
-
-      if (!subscriber.isUnsubscribed()) {
-        subscriber.onCompleted();
-      }
     }
 
     @Override public void unsubscribe() {
@@ -208,7 +187,7 @@ public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
     }
 
     @Override public <R> Observable<Response<R>> adapt(Call<R> call) {
-      Observable<Response<R>> observable = Observable.create(new CallOnSubscribe<>(call));
+      Observable<Response<R>> observable = Observable.fromAsync(new CallAsyncEmitter<>(call), BACKPRESSURE_MODE);
       if (scheduler != null) {
         return observable.subscribeOn(scheduler);
       }
@@ -230,7 +209,7 @@ public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
     }
 
     @Override public <R> Observable<R> adapt(Call<R> call) {
-      Observable<R> observable = Observable.create(new CallOnSubscribe<>(call)) //
+      Observable<R> observable = Observable.fromAsync(new CallAsyncEmitter<>(call), BACKPRESSURE_MODE) //
           .lift(OperatorMapResponseToBodyOrError.<R>instance());
       if (scheduler != null) {
         return observable.subscribeOn(scheduler);
@@ -253,7 +232,7 @@ public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
     }
 
     @Override public <R> Observable<Result<R>> adapt(Call<R> call) {
-      Observable<Result<R>> observable = Observable.create(new CallOnSubscribe<>(call)) //
+      Observable<Result<R>> observable = Observable.fromAsync(new CallAsyncEmitter<>(call), BACKPRESSURE_MODE) //
           .map(new Func1<Response<R>, Result<R>>() {
             @Override public Result<R> call(Response<R> response) {
               return Result.response(response);
